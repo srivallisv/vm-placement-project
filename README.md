@@ -9,13 +9,20 @@ Alibaba Trace → Preprocess → [GRU / Informer / PatchTST] → Confidence
     → Allocation → Energy-Aware Placement → Failure Handling → Consolidation
 ```
 
-**Pipeline stages:**
-1. **Prediction** — 3 deep learning models forecast CPU, Memory, Storage usage
-2. **Confidence** — Error + MC Dropout variance → confidence scores
-3. **Allocation** — Confidence-weighted resource interpolation
-4. **Placement** — Minimum incremental power server selection
-5. **Failure Handling** — Adaptive confidence decay with retry
-6. **Consolidation** — Migrate VMs off underutilized servers
+**Pipeline stages (executed by `python main.py`):**
+
+| Step | Description |
+|------|-------------|
+| 1 | GPU detection and device setup |
+| 2 | Alibaba dataset download and validation |
+| 3 | Preprocessing (normalize, sliding window maps) |
+| 4 | Train GRU — 150 epochs, GPU, milestone checkpoints |
+| 5 | Train Informer — 150 epochs, GPU, milestone checkpoints |
+| 6 | Train PatchTST — 150 epochs, GPU, milestone checkpoints |
+| 7 | **Milestone evaluation** — all 10 metrics at [30,50,70,90,110,130,150] |
+| 8 | **Comparison graphs** — grouped bars, line plots, summary panels |
+| 9 | Placement simulation — energy-aware placement with best model |
+| 10 | CloudSim Plus export — CSV/JSON + Java simulation template |
 
 ---
 
@@ -100,6 +107,40 @@ All models train to completion — no patience logic or best-loss termination.
 
 ---
 
+## Milestone-Based Evaluation
+
+After training, each model is evaluated at every milestone epoch by loading its checkpoint and computing **10 metrics**:
+
+| Category | Metrics |
+|----------|---------|
+| Prediction Accuracy | MAE, RMSE, MAPE |
+| Resource Allocation Quality | Accuracy, Precision, AUC |
+| Energy Efficiency | Energy Consumption, Active Servers |
+| Consolidation & Failures | Migration Count, Failure Rate |
+
+**How it works:**
+1. For each model (GRU, Informer, PatchTST):
+2. For each milestone (30, 50, 70, 90, 110, 130, 150):
+   - Load the saved checkpoint
+   - Run inference on the test set
+   - Compute prediction metrics (MAE, RMSE, MAPE)
+   - Compute confidence via MC Dropout → classify VMs → Accuracy, Precision, AUC
+   - Run placement simulation → Energy, Migrations, Failure Rate, Active Servers
+3. Generate comparison graphs and tables
+
+**No per-epoch comparisons are generated** — only milestone-based comparisons.
+
+### Generated Comparison Graphs
+
+| Graph Type | Count | Description |
+|------------|-------|-------------|
+| `line_*.png` | 10 | Per-metric line plots (x=milestone, y=value, 3 model lines) |
+| `bar_*.png` | 10 | Per-metric grouped bar charts at each milestone |
+| `group_*.png` | 4 | Multi-panel summaries by category (Prediction, Allocation, Energy, Consolidation) |
+| `final_combined_comparison.png` | 1 | Combined bar chart at final milestone (epoch 150) |
+
+---
+
 ## Models
 
 | Model | Architecture | Loss | LR |
@@ -131,25 +172,71 @@ P = P_idle + U × (P_max - P_idle)    (P_idle=150W, P_max=400W)
 
 ---
 
+## CloudSim Plus Integration
+
+The pipeline exports data for use with [CloudSim Plus](https://cloudsimplus.org/) (Java-based cloud simulation):
+
+| Export File | Description |
+|-------------|-------------|
+| `outputs/cloudsim/vm_workloads.csv` | VM resource demands (denormalized to %) |
+| `outputs/cloudsim/host_config.json` | Server specifications (CPU, RAM, Storage, Power) |
+| `outputs/cloudsim/placement_map.csv` | VM-to-Host placement mapping |
+| `outputs/cloudsim/consolidation_events.json` | Migration and consolidation events |
+| `outputs/cloudsim/VmPlacementSimulation.java` | Starter Java simulation template |
+
+To use: copy `outputs/cloudsim/` to your CloudSim Plus project, add the Java template to your source tree, and compile with CloudSim Plus 7.x+ on the classpath.
+
+---
+
 ## Project Structure
 
 ```
 vm-placement-project/
-├── config.py                  # Central configuration
-├── main.py                    # Master pipeline script
-├── requirements.txt           # Dependencies
-├── preprocessing/             # Data download, cleaning, normalization
-├── models/                    # GRU, Informer, PatchTST architectures
-├── training/                  # GPU training scripts (150 epochs, no early stopping)
-├── confidence/                # MC Dropout confidence scoring
-├── allocation/                # Confidence-based resource allocation
-├── placement/                 # Energy-aware VM placement
-├── failure/                   # Adaptive failure handling
-├── consolidation/             # Server consolidation
-├── evaluation/                # Metrics and graph generation
-├── utils/                     # Helpers (seeding, timing, logging)
-├── checkpoints/               # Model checkpoints at milestones
-└── outputs/                   # Metrics, predictions, logs, graphs
+├── config.py                           # Central configuration
+├── main.py                             # Master pipeline (10 steps)
+├── requirements.txt                    # Dependencies
+├── preprocessing/                      # Data download, cleaning, normalization
+│   ├── download_dataset.py             # Alibaba trace download (no synthetic fallback)
+│   ├── preprocess.py                   # Normalize + window position maps
+│   └── dataset.py                      # Lazy sliding-window Dataset (memory-mapped)
+├── models/                             # Deep learning architectures
+│   ├── gru.py                          # Bidirectional GRU
+│   ├── informer.py                     # ProbSparse self-attention encoder-decoder
+│   └── patchtst.py                     # Channel-independent patch transformer
+├── training/                           # GPU training scripts
+│   ├── trainer.py                      # Shared training loop (autocast, GradScaler)
+│   ├── train_gru.py
+│   ├── train_informer.py
+│   └── train_patchtst.py
+├── confidence/                         # MC Dropout confidence scoring
+│   └── confidence_score.py
+├── allocation/                         # Confidence-based resource allocation
+│   └── allocation_engine.py
+├── placement/                          # Energy-aware VM placement
+│   ├── energy_model.py                 # Linear power model
+│   └── placement_engine.py             # Min-ΔP server selection
+├── failure/                            # Adaptive failure handling
+│   └── failure_handler.py              # Confidence decay + retry + Best Fit
+├── consolidation/                      # Server consolidation
+│   └── consolidation_engine.py
+├── evaluation/                         # Metrics and visualization
+│   ├── metrics.py                      # MAE, RMSE, MAPE, classification, base graphs
+│   ├── milestone_evaluator.py          # Full evaluation at each milestone checkpoint
+│   └── comparison_graphs.py            # Milestone comparison visualizations
+├── cloudsim/                           # CloudSim Plus integration
+│   └── cloudsim_exporter.py            # CSV/JSON export + Java template
+├── utils/                              # Helpers (seeding, timing, logging)
+│   └── helpers.py
+├── checkpoints/                        # Model checkpoints (7 milestones × 3 models)
+└── outputs/
+    ├── logs/                           # Full 150-epoch training logs per model
+    ├── metrics/                        # Per-milestone metric CSVs
+    ├── predictions/                    # Prediction subset summaries
+    ├── graphs/                         # Base evaluation graphs
+    │   └── comparisons/                # Milestone comparison graphs (25 plots)
+    ├── comparison_tables/              # Per-model milestone CSVs + text table
+    ├── final_milestone_comparison.csv  # All models × milestones × metrics
+    └── cloudsim/                       # CloudSim Plus export files
 ```
 
 ---
@@ -160,9 +247,10 @@ vm-placement-project/
 |----------|-----------|
 | No synthetic data | Ensures all experiments use only real cloud traces |
 | No early stopping | Required for unbiased convergence analysis |
-| GPU acceleration | Necessary for efficient transformer training on large-scale traces |
+| GPU in training only | Other modules use CPU/numpy — avoids unnecessary GPU overhead |
 | Mixed precision training | Reduces VRAM usage and accelerates training |
-| Lazy window generation | Memory-safe — windows computed on-the-fly in Dataset.__getitem__() |
+| Lazy window generation | Memory-safe — windows computed on-the-fly in Dataset.\_\_getitem\_\_() |
+| Milestone-only comparisons | Avoids 150×3 evaluations; 7 milestones give clear convergence picture |
 | Monte Carlo Dropout | Lightweight uncertainty estimation without ensemble overhead |
 | Channel-independent PatchTST | Official architecture; reduces overfitting |
 | Linear power model | Standard in literature (Beloglazov, 2012) |
@@ -171,14 +259,20 @@ vm-placement-project/
 
 ---
 
-## Outputs
+## Outputs Summary
 
 After a full run, find:
-- `checkpoints/` — 21 model checkpoints (7 milestones × 3 models)
-- `outputs/logs/` — Full 150-epoch training logs per model
-- `outputs/metrics/` — Per-milestone and final summary CSVs
-- `outputs/graphs/` — 10+ evaluation visualizations
-- `outputs/predictions/` — Prediction subset summaries at milestones
+
+| Output | Location |
+|--------|----------|
+| Model checkpoints | `checkpoints/` — 21 files (7 milestones × 3 models) |
+| Training logs | `outputs/logs/` — full 150-epoch CSV per model |
+| Milestone metrics | `outputs/metrics/` — per-milestone CSVs |
+| Comparison graphs | `outputs/graphs/comparisons/` — 25 visualizations |
+| Comparison tables | `outputs/comparison_tables/` — per-model CSVs + text table |
+| Final comparison | `outputs/final_milestone_comparison.csv` |
+| Prediction summaries | `outputs/predictions/` — subset at milestones |
+| CloudSim exports | `outputs/cloudsim/` — CSV, JSON, Java template |
 
 ## License
 
