@@ -35,21 +35,21 @@ from preprocessing.dataset import create_dataloaders, LazyWindowDataset
 from training.train_gru import run_gru_training
 from training.train_informer import run_informer_training
 from training.train_patchtst import run_patchtst_training
-from confidence.confidence_score import run_confidence_pipeline
 from allocation.allocation_engine import run_allocation_pipeline, classify_vms
 from placement.placement_engine import create_server_fleet, run_placement
 from placement.energy_model import compute_datacenter_power
 from failure.failure_handler import handle_failures
 from consolidation.consolidation_engine import consolidate_servers
+from confidence.confidence_score import run_confidence_pipeline
 from evaluation.metrics import (
-    evaluate_predictions, evaluate_classification,
-    plot_training_loss, plot_predictions_vs_actual,
-    plot_confidence_distribution, plot_roc_curves,
-    plot_accuracy_precision_bars, plot_energy_over_time,
-    plot_active_servers, plot_migrations,
-    plot_milestone_metrics, plot_final_comparison,
-    save_summary_csv,
+    evaluate_predictions, plot_training_loss, plot_predictions_vs_actual,
+    plot_confidence_distribution, plot_energy_over_time,
+    plot_active_servers, plot_migrations, save_summary_csv,
 )
+from evaluation.milestone_evaluator import (
+    run_milestone_evaluation, save_milestone_csvs, save_final_comparison_csv,
+)
+from evaluation.comparison_graphs import generate_all_comparison_graphs
 from cloudsim.cloudsim_exporter import run_cloudsim_export
 
 
@@ -165,14 +165,12 @@ def main():
     }
 
     # ================================================================
-    # STEP 7-12: Evaluation pipeline (per model)
+    # STEP 7: Milestone Evaluation (all metrics at milestone epochs)
     # ================================================================
-    print_banner("STEP 6: Evaluation Pipeline")
+    print_banner("STEP 6: Milestone Evaluation")
 
-    # Device for model inference during confidence computation
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Recreate test loader
     test_loader = torch.utils.data.DataLoader(
         LazyWindowDataset("test"),
         batch_size=config.BATCH_SIZE,
@@ -181,7 +179,6 @@ def main():
         pin_memory=config.PIN_MEMORY,
     )
 
-    # Model configurations
     from models.gru import GRUModel
     from models.informer import InformerModel
     from models.patchtst import PatchTSTModel
@@ -208,75 +205,68 @@ def main():
         }),
     }
 
-    all_pred_metrics = {}
-    all_class_results = {}
-    best_confidence = None
-    best_predictions = None
-    best_actuals = None
+    # Run full evaluation at every milestone for all 3 models
+    milestone_results = run_milestone_evaluation(
+        model_configs, test_loader, device
+    )
+
+    # Save milestone metric CSVs
+    save_milestone_csvs(milestone_results)
+    save_final_comparison_csv(milestone_results)
+
+    # ================================================================
+    # STEP 8: Comparison Graphs & Tables (milestone-based only)
+    # ================================================================
+    print_banner("STEP 7: Milestone Comparison Graphs")
+
+    generate_all_comparison_graphs(milestone_results)
+
+    # Also generate training loss curves from full epoch logs
+    plot_training_loss(histories)
+
+    # ================================================================
+    # STEP 9: Placement Simulation (best model at epoch 150)
+    # ================================================================
+    print_banner("STEP 8: Placement Simulation")
+
+    # Determine best model from final milestone
+    last_epoch = config.MILESTONE_EPOCHS[-1]
     best_model_name = None
+    best_rmse = float("inf")
+    for m_name in milestone_results:
+        if last_epoch in milestone_results[m_name]:
+            rmse = milestone_results[m_name][last_epoch].get("RMSE", float("inf"))
+            if rmse < best_rmse:
+                best_rmse = rmse
+                best_model_name = m_name
 
-    for model_name, (model_class, model_kwargs) in model_configs.items():
-        print(f"\n--- Evaluating {model_name.upper()} ---")
+    if best_model_name is None:
+        best_model_name = list(model_configs.keys())[0]
+    print(f"  Best model (lowest RMSE at epoch {last_epoch}): {best_model_name.upper()}")
 
-        # Load trained model
-        model = load_best_model(model_class, model_name, model_kwargs, device)
+    # Load best model for placement simulation
+    best_class, best_kwargs = model_configs[best_model_name]
+    best_model = load_best_model(best_class, best_model_name, best_kwargs, device)
+    best_predictions, best_actuals = get_test_predictions(best_model, test_loader, device)
 
-        # Get predictions
-        predictions, actuals = get_test_predictions(model, test_loader, device)
-        print(f"  Predictions shape: {predictions.shape}")
+    # Compute confidence for best model
+    best_confidence = run_confidence_pipeline(
+        best_model, test_loader, device, best_predictions, best_actuals
+    )
+    n = min(len(best_predictions), len(best_confidence))
+    best_predictions = best_predictions[:n]
+    best_actuals = best_actuals[:n]
 
-        # Prediction metrics
-        pred_m = evaluate_predictions(actuals, predictions)
-        all_pred_metrics[model_name] = pred_m
-        print(f"  Overall — MAE: {pred_m['overall']['MAE']:.5f}, "
-              f"RMSE: {pred_m['overall']['RMSE']:.5f}, "
-              f"MAPE: {pred_m['overall']['MAPE']:.2f}%")
+    # Pred vs actual graphs for best model
+    plot_predictions_vs_actual(best_predictions, best_actuals, best_model_name)
+    plot_confidence_distribution(best_confidence)
 
-        # Prediction vs Actual graphs
-        plot_predictions_vs_actual(predictions, actuals, model_name)
-
-        # Confidence scores
-        confidence = run_confidence_pipeline(
-            model, test_loader, device, predictions, actuals
-        )
-
-        # Classification
-        n = min(len(predictions), len(confidence))
-        pred_step = predictions[:n, 0, :]
-        curr_step = actuals[:n, 0, :]
-        conf_step = confidence[:n, 0, :]
-
-        labels_pred = classify_vms(pred_step, curr_step)
-        # "Ground truth" overload: actual future > current + threshold
-        labels_true = classify_vms(actuals[:n, 0, :], curr_step)
-
-        cls_results = evaluate_classification(
-            labels_true, labels_pred,
-            y_prob=conf_step.mean(axis=1),
-        )
-        all_class_results[model_name] = cls_results
-        print(f"  Classification — Acc: {cls_results['accuracy']:.4f}, "
-              f"Prec: {cls_results['precision']:.4f}")
-
-        # Track best model (lowest overall RMSE) for placement simulation
-        if best_model_name is None or pred_m["overall"]["RMSE"] < all_pred_metrics[best_model_name]["overall"]["RMSE"]:
-            best_model_name = model_name
-            best_predictions = predictions[:n]
-            best_actuals = actuals[:n]
-            best_confidence = confidence
-
-    print(f"\n  Best model for placement: {best_model_name.upper()}")
-
-    # ================================================================
-    # STEP 8-11: Placement Simulation (using best model's predictions)
-    # ================================================================
-    print_banner("STEP 7: Placement Simulation")
-
+    # Allocation
     alloc_result = run_allocation_pipeline(
         best_predictions, best_actuals, best_confidence
     )
 
-    # Simulate over multiple timesteps
+    # Multi-timestep placement simulation
     n_vms = len(alloc_result["allocated"])
     vms_per_step = max(config.MAX_MACHINES if config.DEBUG_MODE else 100, 1)
     n_steps = max(1, n_vms // vms_per_step)
@@ -284,7 +274,6 @@ def main():
     energy_timeline = []
     active_timeline = []
     migration_timeline = []
-
     total_placements = 0
     total_failures = 0
     total_migrations = 0
@@ -301,49 +290,32 @@ def main():
         step_curr = alloc_result["current"][start:end]
         step_conf = alloc_result["confidence"][start:end]
 
-        # Fresh servers each timestep (simulating dynamic placement)
         servers = create_server_fleet()
-
-        # Place VMs
         placement_result = run_placement(servers, step_allocated, step_labels)
         total_placements += step_labels.sum()
         failures = placement_result["failures"]
         total_failures += len(failures)
 
-        # Handle failures
         if failures:
             fail_result = handle_failures(
                 servers, failures, step_pred, step_curr, step_conf
             )
             total_failures -= len(fail_result["recovered"])
 
-        # Consolidate
         consol_result = consolidate_servers(servers, step_allocated)
         total_migrations += consol_result["migrations"]
 
-        # Track metrics
         utils = np.array([s.cpu_util for s in servers if s.is_active])
         energy = compute_datacenter_power(utils) if len(utils) > 0 else 0.0
         energy_timeline.append(energy)
         active_timeline.append(consol_result["active_servers"])
         migration_timeline.append(consol_result["migrations"])
 
-    # ================================================================
-    # STEP 12: Generate all graphs
-    # ================================================================
-    print_banner("STEP 8: Graph Generation")
-
-    plot_training_loss(histories)
-    plot_confidence_distribution(best_confidence)
-    plot_roc_curves(all_class_results)
-    plot_accuracy_precision_bars(all_class_results)
+    # Simulation timeline graphs
     plot_energy_over_time(energy_timeline)
     plot_active_servers(active_timeline, config.NUM_SERVERS)
     plot_migrations(migration_timeline)
-    plot_milestone_metrics(histories)
-    plot_final_comparison(all_pred_metrics)
 
-    # System metrics summary
     system_metrics = {
         "total_placements": int(total_placements),
         "total_failures": total_failures,
@@ -352,15 +324,13 @@ def main():
         "avg_energy": np.mean(energy_timeline) if energy_timeline else 0.0,
         "avg_active_servers": np.mean(active_timeline) if active_timeline else 0.0,
     }
-
-    save_summary_csv(all_pred_metrics, all_class_results, system_metrics)
+    save_summary_csv({}, {}, system_metrics)
 
     # ================================================================
-    # STEP 9: CloudSim Plus Export
+    # STEP 10: CloudSim Plus Export
     # ================================================================
     print_banner("STEP 9: CloudSim Plus Export")
 
-    # Collect last timestep placement for export
     last_placements = placement_result["placements"] if 'placement_result' in dir() else {}
     last_consol = consol_result if 'consol_result' in dir() else {}
     run_cloudsim_export(
@@ -376,16 +346,18 @@ def main():
     # Final summary
     # ================================================================
     print_banner("PIPELINE COMPLETE")
-    print(f"  Models trained    : GRU, Informer, PatchTST (all {config.MAX_EPOCHS} epochs)")
-    print(f"  Best model        : {best_model_name.upper()}")
-    print(f"  Total placements  : {int(total_placements)}")
-    print(f"  Total failures    : {total_failures}")
-    print(f"  Total migrations  : {total_migrations}")
-    print(f"  Avg energy        : {system_metrics['avg_energy']:.1f} W")
-    print(f"  Outputs saved to  : {config.OUTPUT_DIR}")
-    print(f"  Checkpoints at    : {config.CHECKPOINT_DIR}")
-    print(f"  Graphs at         : {config.GRAPHS_DIR}")
-    print(f"  CloudSim exports  : {config.OUTPUT_DIR}/cloudsim/")
+    print(f"  Models trained       : GRU, Informer, PatchTST (all {config.MAX_EPOCHS} epochs)")
+    print(f"  Milestones evaluated : {config.MILESTONE_EPOCHS}")
+    print(f"  Best model           : {best_model_name.upper()} (RMSE={best_rmse:.5f})")
+    print(f"  Total placements     : {int(total_placements)}")
+    print(f"  Total failures       : {total_failures}")
+    print(f"  Total migrations     : {total_migrations}")
+    print(f"  Avg energy           : {system_metrics['avg_energy']:.1f} W")
+    print(f"  Outputs              : {config.OUTPUT_DIR}")
+    print(f"  Comparisons          : {config.GRAPHS_DIR}/comparisons/")
+    print(f"  Comparison tables    : {config.OUTPUT_DIR}/comparison_tables/")
+    print(f"  Final CSV            : {config.OUTPUT_DIR}/final_milestone_comparison.csv")
+    print(f"  CloudSim exports     : {config.OUTPUT_DIR}/cloudsim/")
 
 
 if __name__ == "__main__":
