@@ -1,0 +1,32 @@
+# Data
+data/raw/
+data/processed/
+data/machine_usage_clean.csv
+
+# Outputs
+checkpoints/
+outputs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Virtual env
+venv/
+env/
+.venv/
